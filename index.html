@@ -704,26 +704,18 @@ const EVENTO = {
 };
 
 // Senha do organizador — troque aqui antes de enviar o convite.
-// ATENÇÃO: em um site público no GitHub, a senha fica visível no
-// código-fonte da página. Ela serve para evitar acesso casual dos
-// convidados, não como segurança real.
 const SENHA_ORGANIZADOR = "Deb2026@";
 
 // ============================================================
-// ARMAZENAMENTO COMPARTILHADO (Firebase) — IMPORTANTE!
+// >>> COLE AQUI A URL DO SEU FIREBASE <
+// Ex.: "https://cha-deb-otavio-default-rtdb.firebaseio.com"
+// Com a URL preenchida, TODOS os convidados compartilham os mesmos
+// dados e você vê tudo no painel do organizador.
+// Se deixar "", volta a funcionar só no aparelho de cada um.
 // ============================================================
-// Para que TODOS os convidados vejam as mesmas confirmações e
-// reservas de presentes, preencha abaixo a URL do seu Firebase
-// Realtime Database. Exemplo:
-//   const DATABASE_URL = "https://meu-projeto-default-rtdb.firebaseio.com";
-//
-// Se deixar vazio (""), o site funciona apenas com o localStorage
-// de cada aparelho: cada convidado verá SOMENTE os próprios dados,
-// e as reservas NÃO serão compartilhadas entre eles.
-const DATABASE_URL = "";
+const DATABASE_URL = "https://cha-deb-otavio-default-rtdb.firebaseio.com";
 
-// Lista inicial — usada apenas na primeira vez; depois a lista salva
-// pelo organizador passa a valer para todos.
+// Lista inicial — usada só na primeira vez; depois vale a lista salva no painel.
 const PRESENTES_INICIAIS = [
   { id: "p01", nome: "Abridor de Latas + Abridor de Garrafas", desc: "Inox ou Preto" },
   { id: "p02", nome: "Saca Rolha + Fuê", desc: "Inox ou Preto" },
@@ -764,7 +756,6 @@ const PRESENTES_INICIAIS = [
   { id: "p38", nome: "Mimo a Escolha", desc: "Seja criativo" },
   { id: "p39", nome: "Mimo a Escolha", desc: "Pense com Carinho rs" },
   { id: "p40", nome: "Mimo a Escolha", desc: "Adoramos Surpresas" },
-  
 ];
 
 const KEY_RSVPS = "convite-rsvps";
@@ -772,30 +763,56 @@ const KEY_PRESENTES = "convite-presentes";
 const KEY_LISTA = "convite-lista";
 
 // ============================================================
-// CAMADA DE ARMAZENAMENTO
-// (usa Firebase se DATABASE_URL estiver preenchida;
-//  senão, usa o localStorage do navegador)
+// CAMADA DE ARMAZENAMENTO (Firebase ou localStorage)
+// Agora com gravação/remoção por filho: cada convidado escreve
+// apenas o próprio registro, sem sobrescrever o dos outros.
 // ============================================================
 const storage = {
+  _url(path) {
+    return DATABASE_URL.replace(/\/$/, "") + "/" + path + ".json";
+  },
   async get(key) {
     if (DATABASE_URL) {
-      const res = await fetch(DATABASE_URL.replace(/\/$/, "") + "/" + key + ".json");
+      const res = await fetch(this._url(key));
       if (!res.ok) throw new Error("Falha ao ler dados");
-      return await res.json(); // objeto/array ou null
+      return await res.json();
     }
     const v = localStorage.getItem(key);
     return v ? JSON.parse(v) : null;
   },
   async set(key, value) {
     if (DATABASE_URL) {
-      const res = await fetch(DATABASE_URL.replace(/\/$/, "") + "/" + key + ".json", {
-        method: "PUT",
-        body: JSON.stringify(value),
-      });
+      const res = await fetch(this._url(key), { method: "PUT", body: JSON.stringify(value) });
       if (!res.ok) throw new Error("Falha ao salvar dados");
       return;
     }
     localStorage.setItem(key, JSON.stringify(value));
+  },
+  // grava/atualiza apenas UM filho (não apaga o que os outros salvaram)
+  async setChild(key, childKey, value) {
+    if (DATABASE_URL) {
+      const patch = {};
+      patch[childKey] = value;
+      const res = await fetch(this._url(key), { method: "PATCH", body: JSON.stringify(patch) });
+      if (!res.ok) throw new Error("Falha ao salvar dados");
+      return;
+    }
+    const v = localStorage.getItem(key);
+    const obj = v ? JSON.parse(v) : {};
+    obj[childKey] = value;
+    localStorage.setItem(key, JSON.stringify(obj));
+  },
+  // remove UM filho específico
+  async removeChild(key, childKey) {
+    if (DATABASE_URL) {
+      const res = await fetch(this._url(key + "/" + childKey), { method: "DELETE" });
+      if (!res.ok) throw new Error("Falha ao remover dados");
+      return;
+    }
+    const v = localStorage.getItem(key);
+    const obj = v ? JSON.parse(v) : {};
+    delete obj[childKey];
+    localStorage.setItem(key, JSON.stringify(obj));
   },
 };
 
@@ -811,6 +828,7 @@ let organizador = false;
 let abaOrg = "confirmacoes";
 let rascunho = [];
 let salvandoLista = false;
+let intervaloOrg = null; // atualização automática do painel
 
 // ============================================================
 // UTILITÁRIOS
@@ -853,7 +871,6 @@ function guiarParaPresentes() {
   $("banner-presente").classList.remove("escondido");
   const sec = $("secao-presentes");
   sec.classList.remove("destaque");
-  // força reinício da animação de destaque
   void sec.offsetWidth;
   sec.classList.add("destaque");
   sec.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -861,7 +878,7 @@ function guiarParaPresentes() {
 }
 
 function mostrarSucesso(titulo, texto) {
-  $("check-anim").innerHTML = SVG_CHECK; // reinicia a animação do check
+  $("check-anim").innerHTML = SVG_CHECK;
   $("sucesso-titulo").textContent = titulo;
   $("sucesso-texto").textContent = texto;
   $("overlay-sucesso").classList.remove("escondido");
@@ -903,24 +920,22 @@ async function confirmarPresenca() {
   const presenca = $("inp-presenca").value;
   const acompanhantes = presenca === "sim" ? Number($("inp-acompanhantes").value) || 0 : 0;
   try {
-    let atuais = {};
-    try { atuais = (await storage.get(KEY_RSVPS)) || {}; } catch (e) {}
-    atuais[chaveAtual()] = {
+    const registro = {
       nome: nome,
       presenca: presenca,
       acompanhantes: acompanhantes,
       mensagem: $("inp-mensagem").value.trim(),
       em: new Date().toISOString(),
     };
-    await storage.set(KEY_RSVPS, atuais);
-    rsvps = atuais;
+    // grava só o próprio registro (não sobrescreve os outros convidados)
+    await storage.setChild(KEY_RSVPS, chaveAtual(), registro);
+    rsvps[chaveAtual()] = registro;
     confirmado = true;
     renderTudo();
 
     if (presenca === "sim") {
       const jaTemPresente = Object.values(claims).some((c) => c.chave === chaveAtual());
       if (jaTemPresente) {
-        // já tinha escolhido o presente antes de (re)confirmar
         mostrarAviso("Presença de " + nome + " atualizada.");
         mostrarSucesso(
           "Confirmação enviada e presente salvo com sucesso! 🎉",
@@ -952,33 +967,38 @@ async function escolherPresente(p) {
     return;
   }
   try {
-    let atuais = {};
+    // busca o estado mais recente do servidor para detectar conflitos
+    let atuais = claims;
     try { atuais = (await storage.get(KEY_PRESENTES)) || {}; } catch (e) {}
+    claims = atuais;
 
     const dono = atuais[p.id];
 
+    // já é meu -> liberar
     if (dono && dono.chave === chave) {
-      delete atuais[p.id];
-      await storage.set(KEY_PRESENTES, atuais);
-      claims = atuais;
+      await storage.removeChild(KEY_PRESENTES, p.id);
+      delete claims[p.id];
       mostrarAviso('Você liberou "' + p.nome + '". Escolha outro item da lista.');
       if (temRsvpSim(chave)) $("banner-presente").classList.remove("escondido");
       renderTudo();
       return;
     }
+    // ocupado por outra pessoa
     if (dono) {
-      claims = atuais;
       mostrarAviso('"' + p.nome + '" já foi escolhido por ' + dono.nome + ". Que tal outro item?");
       renderTudo();
       return;
     }
     // remove qualquer outra reserva minha (1 presente por convidado)
-    Object.keys(atuais).forEach((id) => {
-      if (atuais[id].chave === chave) delete atuais[id];
-    });
-    atuais[p.id] = { chave: chave, nome: nome, em: new Date().toISOString() };
-    await storage.set(KEY_PRESENTES, atuais);
-    claims = atuais;
+    const meusIds = Object.keys(claims).filter((id) => claims[id].chave === chave);
+    for (const id of meusIds) {
+      await storage.removeChild(KEY_PRESENTES, id);
+      delete claims[id];
+    }
+    const registro = { chave: chave, nome: nome, em: new Date().toISOString() };
+    await storage.setChild(KEY_PRESENTES, p.id, registro);
+    claims[p.id] = registro;
+
     $("banner-presente").classList.add("escondido");
     mostrarAviso('"' + p.nome + '" reservado para você, ' + nome + "!");
     renderTudo();
@@ -1016,7 +1036,9 @@ function validarSenha() {
     abaOrg = "confirmacoes";
     $("bloco-senha").classList.add("escondido");
     $("painel-org").classList.remove("escondido");
+    garantirBotaoAtualizar();
     carregar();
+    iniciarAtualizacaoAuto();
   } else {
     const el = $("erro-senha");
     el.textContent = "Senha incorreta. Tente novamente.";
@@ -1032,6 +1054,7 @@ function cancelarSenha() {
 function sairAreaOrganizador() {
   organizador = false;
   rascunho = [];
+  pararAtualizacaoAuto();
   $("painel-org").classList.add("escondido");
   $("bloco-btn-org").classList.remove("escondido");
 }
@@ -1044,9 +1067,61 @@ function trocarAba(aba) {
   renderPainel();
 }
 
+// atualização automática do painel enquanto está aberto
+function iniciarAtualizacaoAuto() {
+  pararAtualizacaoAuto();
+  intervaloOrg = setInterval(async () => {
+    if (!organizador) return;
+    try {
+      const [r, c] = await Promise.all([
+        storage.get(KEY_RSVPS),
+        storage.get(KEY_PRESENTES),
+      ]);
+      rsvps = r || {};
+      claims = c || {};
+      // não re-renderiza a aba "editar" para não atrapalhar a digitação
+      if (abaOrg !== "editar") renderPainel();
+      renderPresentes();
+    } catch (e) {}
+  }, 10000);
+}
+
+function pararAtualizacaoAuto() {
+  if (intervaloOrg) { clearInterval(intervaloOrg); intervaloOrg = null; }
+}
+
+// injeta um botão "Atualizar agora" ao lado do "Sair" (sem mexer no HTML)
+async function atualizarAgora() {
+  try {
+    const [r, c] = await Promise.all([
+      storage.get(KEY_RSVPS),
+      storage.get(KEY_PRESENTES),
+    ]);
+    rsvps = r || {};
+    claims = c || {};
+    if (abaOrg !== "editar") renderPainel();
+    renderPresentes();
+    mostrarAviso("Painel atualizado.");
+  } catch (e) {
+    mostrarAviso("Não foi possível atualizar agora.", true);
+  }
+}
+
+function garantirBotaoAtualizar() {
+  if ($("btn-atualizar-org")) return;
+  const topo = document.querySelector(".painel-topo");
+  const btnSair = $("btn-sair-org");
+  if (!topo || !btnSair) return;
+  const btn = document.createElement("button");
+  btn.id = "btn-atualizar-org";
+  btn.className = "btn-secundario";
+  btn.textContent = "🔄 Atualizar agora";
+  btn.addEventListener("click", atualizarAgora);
+  topo.insertBefore(btn, btnSair);
+}
+
 // ============================================================
 // REMOVER CONVIDADO (organizador)
-// Exclui a confirmação e devolve o presente reservado à lista.
 // ============================================================
 async function removerConvidado(chaveRsvp, r) {
   const ok = window.confirm(
@@ -1057,26 +1132,17 @@ async function removerConvidado(chaveRsvp, r) {
 
   mostrarAviso("");
   try {
-    // remove o RSVP
-    let atuaisRsvps = {};
-    try { atuaisRsvps = (await storage.get(KEY_RSVPS)) || {}; } catch (e) {}
-    delete atuaisRsvps[chaveRsvp];
-    await storage.set(KEY_RSVPS, atuaisRsvps);
+    await storage.removeChild(KEY_RSVPS, chaveRsvp);
+    delete rsvps[chaveRsvp];
 
-    // libera o(s) presente(s) reservado(s) por essa pessoa
-    let atuaisClaims = {};
-    try { atuaisClaims = (await storage.get(KEY_PRESENTES)) || {}; } catch (e) {}
+    const ids = Object.keys(claims).filter((id) => claims[id].chave === chaveRsvp);
     let liberou = false;
-    Object.keys(atuaisClaims).forEach((id) => {
-      if (atuaisClaims[id].chave === chaveRsvp) {
-        delete atuaisClaims[id];
-        liberou = true;
-      }
-    });
-    if (liberou) await storage.set(KEY_PRESENTES, atuaisClaims);
+    for (const id of ids) {
+      await storage.removeChild(KEY_PRESENTES, id);
+      delete claims[id];
+      liberou = true;
+    }
 
-    rsvps = atuaisRsvps;
-    claims = atuaisClaims;
     mostrarAviso(
       'Confirmação de ' + r.nome + ' removida' +
       (liberou ? " e o presente voltou para a lista." : ".")
@@ -1123,19 +1189,14 @@ async function salvarLista() {
   try {
     await storage.set(KEY_LISTA, limpa);
 
-    let atuais = {};
-    try { atuais = (await storage.get(KEY_PRESENTES)) || {}; } catch (e) {}
     const idsValidos = new Set(limpa.map((p) => p.id));
-    let mudou = false;
-    Object.keys(atuais).forEach((id) => {
+    for (const id of Object.keys(claims)) {
       if (!idsValidos.has(id)) {
-        delete atuais[id];
-        mudou = true;
+        await storage.removeChild(KEY_PRESENTES, id);
+        delete claims[id];
       }
-    });
-    if (mudou) await storage.set(KEY_PRESENTES, atuais);
+    }
 
-    claims = atuais;
     presentes = limpa;
     abaOrg = "presentes";
     mostrarAviso("Lista de presentes atualizada para todos os convidados.");
@@ -1280,7 +1341,6 @@ function renderPainel() {
           : "") +
         (r.mensagem ? '<span class="msg">“' + esc(r.mensagem) + "”</span>" : "");
 
-      // botão de exclusão do convidado (libera o presente reservado)
       const btnDel = document.createElement("button");
       btnDel.className = "btn-remover btn-remover-rsvp";
       btnDel.textContent = "Remover convidado";
@@ -1374,7 +1434,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("inp-nome").addEventListener("input", () => {
     confirmado = false;
     renderResumoConfirmacoes();
-    renderPresentes(); // atualiza destaque "sua escolha"
+    renderPresentes();
   });
 
   $("inp-presenca").addEventListener("change", (e) => {
